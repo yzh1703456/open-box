@@ -6,6 +6,7 @@
 # Author: Aaron Klein, Marius Lindauer
 
 import abc
+import copy
 import time
 import warnings
 from typing import Iterable, List, Union, Tuple, Optional
@@ -13,6 +14,7 @@ import random
 import scipy.optimize
 import numpy as np
 
+from ConfigSpace.hyperparameters import CategoricalHyperparameter
 from openbox import logger
 from openbox.acquisition_function.acquisition import AbstractAcquisitionFunction
 from openbox.utils.config_space import get_one_exchange_neighbourhood, \
@@ -576,7 +578,16 @@ class ScipyOptimizer(AcquisitionFunctionMaximizer):
         self.random_chooser = ChooserProb(prob=rand_prob, rng=rng)
 
         types, bounds = get_types(self.config_space)    # todo: support constant hp in scipy optimizer
-        assert all(types == 0), 'Scipy optimizer (L-BFGS-B) only supports Integer and Float parameters.'
+        # assert all(types == 0), 'Scipy optimizer (L-BFGS-B) only supports Integer and Float parameters.'
+        
+        # for Ordinal and Categorical parameters
+        for i, param in enumerate(self.config_space.get_hyperparameters()):
+            if isinstance(param, (CategoricalHyperparameter)):
+                n_cats = len(param.choices)
+                types[i] = n_cats
+                bounds[i] = (0, int(n_cats) - 1)
+            
+
         self.bounds = bounds
 
         options = dict(disp=False, maxiter=1000)
@@ -591,7 +602,17 @@ class ScipyOptimizer(AcquisitionFunctionMaximizer):
 
         def negative_acquisition(x):
             # shape of x = (d,)
-            x = np.clip(x, 0.0, 1.0)    # fix numerical problem in L-BFGS-B
+            lb = self.bounds[:,0]
+            ub = self.bounds[:,1]
+
+            lb = np.array([float(x) if x is not None else -np.inf
+                           for x in lb])
+            ub = np.array([float(x) if x is not None else np.inf
+                           for x in ub])
+
+            # x = np.clip(x, 0.0, 1.0)    # fix numerical problem in L-BFGS-B
+            x = np.clip(x, lb, ub)  # # fix numerical problem in L-BFGS-B support Categorical and Ordinal
+            
             try:
                 # self.config_space._check_forbidden(x)
                 Configuration(self.config_space, vector=x).is_valid_configuration()
@@ -611,10 +632,20 @@ class ScipyOptimizer(AcquisitionFunctionMaximizer):
                                              x0=init_point,
                                              bounds=self.bounds,
                                              **self.scipy_config)
+
         if not result.success:
             logger.debug('Scipy optimizer failed. Info:\n%s' % (result,))
         try:
-            x = np.clip(result.x, 0.0, 1.0)  # fix numerical problem in L-BFGS-B
+            lb = self.bounds[:, 0]
+            ub = self.bounds[:, 1]
+            lb = np.array([float(x) if x is not None else -np.inf
+                           for x in lb])
+            ub = np.array([float(x) if x is not None else np.inf
+                           for x in ub])
+
+            # x = np.clip(result.x, 0.0, 1.0)  # fix numerical problem in L-BFGS-B
+            x = np.clip(result.x, lb, ub)  # # fix numerical problem in L-BFGS-B support Categorical and Ordinal
+
             config = Configuration(self.config_space, vector=x)
             config.is_valid_configuration()
             acq = self.acquisition_function(x, convert=False)
