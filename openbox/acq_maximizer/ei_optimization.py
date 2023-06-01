@@ -6,6 +6,8 @@
 # Author: Aaron Klein, Marius Lindauer
 
 import abc
+import copy
+import math
 import time
 import warnings
 from typing import Iterable, List, Union, Tuple, Optional
@@ -13,6 +15,9 @@ import random
 import scipy.optimize
 import numpy as np
 
+from ConfigSpace.hyperparameters import CategoricalHyperparameter, \
+    UniformFloatHyperparameter, UniformIntegerHyperparameter, Constant, \
+    OrdinalHyperparameter
 from openbox import logger
 from openbox.acquisition_function.acquisition import AbstractAcquisitionFunction
 from openbox.utils.config_space import get_one_exchange_neighbourhood, \
@@ -354,11 +359,11 @@ class LocalSearch(AcquisitionFunctionMaximizer):
                 if len(time_n) == 0:
                     time_n.append(0.0)
                 logger.debug("Local search took %d steps and looked at %d "
-                                  "configurations. Computing the acquisition "
-                                  "value for one configuration took %f seconds"
-                                  " on average.",
-                                  local_search_steps, neighbors_looked_at,
-                                  np.mean(time_n))
+                             "configurations. Computing the acquisition "
+                             "value for one configuration took %f seconds"
+                             " on average.",
+                             local_search_steps, neighbors_looked_at,
+                             np.mean(time_n))
                 break
 
         return acq_val_incumbent, incumbent
@@ -575,9 +580,10 @@ class ScipyOptimizer(AcquisitionFunctionMaximizer):
         super().__init__(acquisition_function, config_space, rng)
         self.random_chooser = ChooserProb(prob=rand_prob, rng=rng)
 
-        types, bounds = get_types(self.config_space)    # todo: support constant hp in scipy optimizer
-        assert all(types == 0), 'Scipy optimizer (L-BFGS-B) only supports Integer and Float parameters.'
-        self.bounds = bounds
+        # types, bounds = get_types(self.config_space)    # todo: support constant hp in scipy optimizer
+        # assert all(types == 0), 'Scipy optimizer (L-BFGS-B) only supports Integer and Float parameters.'
+
+        self.discrete_dims, self.bounds = self.get_bounds()
 
         options = dict(disp=False, maxiter=1000)
         self.scipy_config = dict(tol=None, method='L-BFGS-B', options=options)
@@ -591,12 +597,15 @@ class ScipyOptimizer(AcquisitionFunctionMaximizer):
 
         def negative_acquisition(x):
             # shape of x = (d,)
-            x = np.clip(x, 0.0, 1.0)    # fix numerical problem in L-BFGS-B
+            x = np.clip(x, self.bounds[:, 0], self.bounds[:, 1])  # fix numerical problem in L-BFGS-B
+            x[self.discrete_dims] = np.round(x[self.discrete_dims])  # support Categorical, Ordinal and Constant
+
             try:
                 # self.config_space._check_forbidden(x)
                 Configuration(self.config_space, vector=x).is_valid_configuration()
             except ValueError:
                 return np.inf
+
             return -self.acquisition_function(x, convert=False)[0]  # shape=(1,)
 
         if initial_config is None:
@@ -611,10 +620,13 @@ class ScipyOptimizer(AcquisitionFunctionMaximizer):
                                              x0=init_point,
                                              bounds=self.bounds,
                                              **self.scipy_config)
+
         if not result.success:
             logger.debug('Scipy optimizer failed. Info:\n%s' % (result,))
         try:
-            x = np.clip(result.x, 0.0, 1.0)  # fix numerical problem in L-BFGS-B
+            x = np.clip(result.x, self.bounds[:, 0], self.bounds[:, 1])  # fix numerical problem in L-BFGS-B
+            x[self.discret_dims] = np.round(x[self.discret_dims])  # support Categorical, Ordinal and Constant
+
             config = Configuration(self.config_space, vector=x)
             config.is_valid_configuration()
             acq = self.acquisition_function(x, convert=False)
@@ -638,6 +650,38 @@ class ScipyOptimizer(AcquisitionFunctionMaximizer):
             **kwargs
     ) -> Iterable[Tuple[float, Configuration]]:
         raise NotImplementedError()
+
+    def get_bounds(self):
+        discrete_dims = []
+        bounds = []
+
+        for i, param in enumerate(self.config_space.get_hyperparameters()):
+            if isinstance(param, CategoricalHyperparameter):
+                discrete_dims.append(i)
+                bounds.append((0, param.num_choices - 1))
+
+            elif isinstance(param, OrdinalHyperparameter):
+                discrete_dims.append(i)
+                bounds.append((0, param.num_elements - 1))
+
+            elif isinstance(param, Constant):
+                discrete_dims.append(i)
+                bounds.append((-0.01, 0.01))  # for round to 0
+
+            elif isinstance(param, UniformFloatHyperparameter):  # Are sampled on the unit hypercube thus the bounds
+                bounds.append((0.0, 1.0))
+
+            elif isinstance(param, UniformIntegerHyperparameter):
+                bounds.append((0.0, 1.0))
+
+            elif not isinstance(param, (UniformFloatHyperparameter,
+                                        UniformIntegerHyperparameter,
+                                        OrdinalHyperparameter,
+                                        CategoricalHyperparameter,
+                                        Constant)):
+                raise TypeError("Unknown hyperparameter type %s" % type(param))
+
+        return discrete_dims, np.array(bounds, dtype=np.float)
 
 
 class RandomScipyOptimizer(AcquisitionFunctionMaximizer):
@@ -693,7 +737,7 @@ class RandomScipyOptimizer(AcquisitionFunctionMaximizer):
         success_count = 0
         for config in scipy_initial_configs:
             scipy_configs = self.scipy_optimizer.maximize(runhistory, initial_config=config).challengers
-            if not scipy_configs:   # empty
+            if not scipy_configs:  # empty
                 continue
             scipy_acqs = self.acquisition_function(scipy_configs)
             acq_configs.extend(zip(scipy_acqs, scipy_configs))
@@ -775,7 +819,8 @@ class ScipyGlobalOptimizer(AcquisitionFunctionMaximizer):
             pass
 
         if not acq_configs:  # empty
-            logger.warning('Scipy differential evolution optimizer failed. Return empty config list. Info:\n%s' % (result,))
+            logger.warning(
+                'Scipy differential evolution optimizer failed. Return empty config list. Info:\n%s' % (result,))
 
         challengers = ChallengerList([config for _, config in acq_configs],
                                      self.config_space,
@@ -850,7 +895,7 @@ class StagedBatchScipyOptimizer(AcquisitionFunctionMaximizer):
         return random_points[idx]
 
     def gen_batch_scipy_points(self, initial_points: np.ndarray):
-        #count = 0  # todo remove
+        # count = 0  # todo remove
         def f(X_flattened):
             # nonlocal count
             # count += 1
@@ -869,14 +914,14 @@ class StagedBatchScipyOptimizer(AcquisitionFunctionMaximizer):
             bounds=bounds,
             options=dict(maxiter=self.scipy_max_iter),
         )
-        #print('count=', count)  # todo remove
+        # print('count=', count)  # todo remove
 
         # return result.x even failed. may because 'STOP: TOTAL NO. of ITERATIONS REACHED LIMIT'
         # if not result.success:
         #     logger.warning('Scipy minimizer %s failed in this round: %s.' % (self.method, result))
         #     return None
 
-        #print(result.x.reshape(shapeX))    # todo remove
+        # print(result.x.reshape(shapeX))    # todo remove
         return result.x.reshape(shapeX)
 
     def maximize(
