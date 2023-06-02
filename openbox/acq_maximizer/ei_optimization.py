@@ -6,22 +6,21 @@
 # Author: Aaron Klein, Marius Lindauer
 
 import abc
-import copy
-import math
 import time
 import warnings
 from typing import Iterable, List, Union, Tuple, Optional
 import random
 import scipy.optimize
 import numpy as np
+from ConfigSpace import (
+    Configuration, ConfigurationSpace,
+    UniformIntegerHyperparameter, UniformFloatHyperparameter,
+    CategoricalHyperparameter, OrdinalHyperparameter, Constant,
+)
 
-from ConfigSpace.hyperparameters import CategoricalHyperparameter, \
-    UniformFloatHyperparameter, UniformIntegerHyperparameter, Constant, \
-    OrdinalHyperparameter
 from openbox import logger
 from openbox.acquisition_function.acquisition import AbstractAcquisitionFunction
-from openbox.utils.config_space import get_one_exchange_neighbourhood, \
-    Configuration, ConfigurationSpace
+from openbox.utils.config_space import get_one_exchange_neighbourhood
 from openbox.acq_maximizer.random_configuration_chooser import ChooserNoCoolDown, ChooserProb
 from openbox.utils.history import History, MultiStartHistory
 from openbox.utils.util_funcs import get_types
@@ -580,10 +579,7 @@ class ScipyOptimizer(AcquisitionFunctionMaximizer):
         super().__init__(acquisition_function, config_space, rng)
         self.random_chooser = ChooserProb(prob=rand_prob, rng=rng)
 
-        # types, bounds = get_types(self.config_space)    # todo: support constant hp in scipy optimizer
-        # assert all(types == 0), 'Scipy optimizer (L-BFGS-B) only supports Integer and Float parameters.'
-
-        self.discrete_dims, self.bounds = self.get_bounds()
+        self.bounds, self.discrete_dims = self._get_bounds(config_space)
 
         options = dict(disp=False, maxiter=1000)
         self.scipy_config = dict(tol=None, method='L-BFGS-B', options=options)
@@ -599,13 +595,11 @@ class ScipyOptimizer(AcquisitionFunctionMaximizer):
             # shape of x = (d,)
             x = np.clip(x, self.bounds[:, 0], self.bounds[:, 1])  # fix numerical problem in L-BFGS-B
             x[self.discrete_dims] = np.round(x[self.discrete_dims])  # support Categorical, Ordinal and Constant
-
             try:
                 # self.config_space._check_forbidden(x)
                 Configuration(self.config_space, vector=x).is_valid_configuration()
             except ValueError:
                 return np.inf
-
             return -self.acquisition_function(x, convert=False)[0]  # shape=(1,)
 
         if initial_config is None:
@@ -651,37 +645,25 @@ class ScipyOptimizer(AcquisitionFunctionMaximizer):
     ) -> Iterable[Tuple[float, Configuration]]:
         raise NotImplementedError()
 
-    def get_bounds(self):
-        discrete_dims = []
+    @staticmethod
+    def _get_bounds(config_space):
         bounds = []
+        discrete_dims = []
+        for i, param in enumerate(config_space.get_hyperparameters()):
+            if isinstance(param, (CategoricalHyperparameter, OrdinalHyperparameter, Constant)):
+                discrete_dims.append(i)
 
-        for i, param in enumerate(self.config_space.get_hyperparameters()):
             if isinstance(param, CategoricalHyperparameter):
-                discrete_dims.append(i)
-                bounds.append((0, param.num_choices - 1))
-
+                bounds.append([0, param.num_choices - 1])
             elif isinstance(param, OrdinalHyperparameter):
-                discrete_dims.append(i)
-                bounds.append((0, param.num_elements - 1))
-
+                bounds.append([0, param.num_elements - 1])
             elif isinstance(param, Constant):
-                discrete_dims.append(i)
-                bounds.append((-0.01, 0.01))  # for round to 0
-
-            elif isinstance(param, UniformFloatHyperparameter):  # Are sampled on the unit hypercube thus the bounds
-                bounds.append((0.0, 1.0))
-
-            elif isinstance(param, UniformIntegerHyperparameter):
-                bounds.append((0.0, 1.0))
-
-            elif not isinstance(param, (UniformFloatHyperparameter,
-                                        UniformIntegerHyperparameter,
-                                        OrdinalHyperparameter,
-                                        CategoricalHyperparameter,
-                                        Constant)):
+                bounds.append([-0.01, 0.01])  # for round to 0
+            elif isinstance(param, (UniformFloatHyperparameter, UniformIntegerHyperparameter)):
+                bounds.append([0.0, 1.0])
+            else:
                 raise TypeError("Unknown hyperparameter type %s" % type(param))
-
-        return discrete_dims, np.array(bounds, dtype=np.float)
+        return np.array(bounds, dtype=np.float64), discrete_dims
 
 
 class RandomScipyOptimizer(AcquisitionFunctionMaximizer):
